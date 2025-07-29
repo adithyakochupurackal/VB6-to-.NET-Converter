@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
@@ -19,9 +19,6 @@ import time
 import re
 from sse_starlette.sse import EventSourceResponse
 from enum import Enum
-import uuid
-from pathlib import Path
-import shutil
 
 # Define AgentState Enum
 class AgentState(Enum):
@@ -41,47 +38,28 @@ class SSELogHandler(logging.Handler):
         self.queue = asyncio.Queue()
         self.progress = 0
         self.total_stages = 6  # Ingestor, Parser, ContextAnalyzer, Summarizer, Generator, FileBuilder
-        self.current_agent = None
-        self.stage_descriptions = {
-            "ingestor": "Ingesting VB6 project files from ZIP or GitHub",
-            "parser": "Parsing VB6 code to extract procedures and events",
-            "context_analyzer": "Analyzing application context and workflow",
-            "summarizer": "Summarizing parsed data for code generation",
-            "generator": "Generating .NET 9 Worker Service code",
-            "filebuilder": "Building and packaging the .NET project ZIP"
-        }
 
     def emit(self, record):
         try:
             msg = self.format(record)
             event_type = getattr(record, 'event_type', 'log')
             stage = getattr(record, 'stage', 'general')
-            agent = getattr(record, 'agent', None)
-            state = getattr(record, 'state', None)
-
-            # Update current agent when an agent transitions to RUNNING
-            if event_type == "state_update" and state == AgentState.RUNNING.value:
-                self.current_agent = agent
-            elif event_type == "state_update" and state in [AgentState.COMPLETED.value, AgentState.FAILED.value]:
-                self.current_agent = None if self.current_agent == agent else self.current_agent
-
+            
             # Update progress based on stage completion
-            if event_type == "state_update" and state == AgentState.COMPLETED.value:
+            if event_type == "state_update" and getattr(record, 'state', None) == AgentState.COMPLETED.value:
                 self.progress = min(self.progress + (100 // self.total_stages), 100)
-
+            
             self.queue.put_nowait({
                 "event_type": event_type,
                 "level": record.levelname,
                 "message": msg,
                 "timestamp": time.time(),
                 "stage": stage,
-                "agent": agent,
-                "state": state,
-                "current_agent": self.current_agent,
+                "agent": getattr(record, 'agent', None),
+                "state": getattr(record, 'state', None),
                 "progress": self.progress,
                 "details": {
-                    "stage_progress": self._get_stage_progress(stage, state),
-                    "stage_description": self.stage_descriptions.get(stage.lower(), "General processing")
+                    "stage_progress": self._get_stage_progress(stage, getattr(record, 'state', None))
                 }
             })
         except Exception:
@@ -118,13 +96,9 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", 50))
 MAX_CODE_LENGTH = int(os.getenv("MAX_CODE_LENGTH", 100000))
 ALLOWED_GITHUB_DOMAINS = ["github.com"]
 MAX_FILES = int(os.getenv("MAX_FILES", 50))
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(exist_ok=True)
-FILE_EXPIRATION_SECONDS = 3600  # 1 hour
-CONVERSION_TIMEOUT_SECONDS = 600  # 10 minutes
 
 # Initialize FastAPI app
-app = FastAPI(title="VB6 to .NET Converter", version="2.0.6", description="Convert VB6 projects to .NET 9 Worker Services with enhanced SSE streaming and download endpoint")
+app = FastAPI(title="VB6 to .NET Converter", version="2.0.4", description="Convert VB6 projects to .NET 9 Worker Services with enhanced SSE streaming")
 
 # Add CORS middleware
 app.add_middleware(
@@ -149,37 +123,25 @@ formatter = logging.Formatter('%(message)s')
 sse_handler.setFormatter(formatter)
 logger.addHandler(sse_handler)
 
-# Clean up old output files on startup
-def cleanup_old_files():
-    """Remove ZIP files older than FILE_EXPIRATION_SECONDS."""
-    current_time = time.time()
-    for file_path in OUTPUT_DIR.glob("*.zip"):
-        if (current_time - file_path.stat().st_mtime) > FILE_EXPIRATION_SECONDS:
-            try:
-                file_path.unlink()
-                logger.info(f"Deleted expired file: {file_path}", extra={"stage": "cleanup"})
-            except Exception as e:
-                logger.error(f"Failed to delete expired file {file_path}: {e}", extra={"stage": "cleanup"})
-
-cleanup_old_files()
-
 # Fixed JSON cleaning function
 def clean_json_response(response: str) -> str:
     """Clean and fix common JSON issues from AI responses."""
     if not response:
         return response
+    
     try:
         response = re.sub(r'```', '', response)
         response = re.sub(r'```\s*$', '', response)
         response = re.sub(r'^```', '', response)
-        response = re.sub(r',\s*}', '}', response)
-        response = re.sub(r',\s*]', ']', response)
+        response = re.sub(r'```', '', response)
         first_brace = response.find('{')
         if first_brace > 0:
             response = response[first_brace:]
         last_brace = response.rfind('}')
         if last_brace > 0:
             response = response[:last_brace + 1]
+        response = re.sub(r',\s*}', '}', response)
+        response = re.sub(r',\s*]', ']', response)
         return response.strip()
     except Exception as e:
         logger.error(f"Error cleaning JSON response: {e}", extra={"stage": "json_cleaning"})
@@ -292,6 +254,7 @@ Extract ALL procedures, functions, and event handlers (e.g., Form_Load, Command1
 
 VB6 Code to analyze:
 {code[:8000]}"""
+        
         try:
             raw = self.lm.forward(prompt=prompt)
             if raw:
@@ -332,7 +295,7 @@ Return ONLY a valid JSON object with this structure:
   "data_flow": [
     {{
       "from": "source module/procedure",
-      "to": "destination module/procedure",
+      "to": "destination module/procedure", 
       "data_type": "type of data",
       "processing": "what happens to the data"
     }}
@@ -368,6 +331,7 @@ Incorporate ALL parsed procedures, events, and globals across all modules. Ident
 
 Parsed VB6 Data:
 {json.dumps(parsed_results, indent=2)[:4000]}"""
+        
         try:
             raw = self.lm.forward(prompt=prompt)
             if raw:
@@ -398,7 +362,9 @@ class GeneratorModule(dspy.Module):
             globals_list = summary_data.get('globals', [])
             main_logic = summary_data.get('main_logic', {})
             metadata = summary_data.get('metadata', {})
+            
             logger.info(f"Generating Worker.cs with {len(procedures)} procedures and {len(globals_list)} globals", extra={"stage": "generator"})
+            
             result = self._build_complete_project(
                 self._generate_comprehensive_worker(procedures, globals_list, context_map, main_logic, metadata)
             )
@@ -415,6 +381,7 @@ class GeneratorModule(dspy.Module):
         execute_async_code = self._generate_execute_async(procedures, main_logic, context_map)
         primary_module = main_logic.get('primary_module', 'ConvertedService')
         namespace = f"{self._sanitize_namespace(primary_module)}Namespace"
+        
         return f"""using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
@@ -430,8 +397,10 @@ namespace {namespace};
 public class Worker : BackgroundService
 {{
     private readonly ILogger<Worker> _logger;
+    
     // VB6 Converted Global Variables
 {fields_code}
+    
     // Processing state fields
     private bool _isProcessing;
     private DateTime _lastProcessTime;
@@ -459,13 +428,17 @@ public class Worker : BackgroundService
             _mlngMetaDataTout = 60000;
             _mbytMetaDataReq = 0;
             _mintMetaDataBC = 0;
+            
             _msgData = new byte[_bc];
             _maskData = new byte[_bc];
+            
             {self._generate_field_initializations(globals_list)}
+            
             _isProcessing = false;
             _lastProcessTime = DateTime.Now;
             _processedCount = 0;
             _errorCount = 0;
+            
             _logger.LogInformation("VB6 Worker Service initialized with {{procedureCount}} procedures and {{globalCount}} globals", {len(procedures)}, {len(globals_list)});
         }}
     }}
@@ -481,15 +454,20 @@ public class Worker : BackgroundService
             _logger.LogDebug("Already processing, skipping cycle");
             return;
         }}
+
         _isProcessing = true;
         var cycleStart = DateTime.Now;
+        
         try
         {{
             _logger.LogInformation("Starting VB6 processing cycle #{{count}}", _processedCount + 1);
+            
             await ExecuteVB6Procedures(stoppingToken);
+            
             _processedCount++;
             _lastProcessTime = DateTime.Now;
             _errorCount = Math.Max(0, _errorCount - 1);
+            
             var cycleDuration = DateTime.Now - cycleStart;
             _logger.LogInformation("Completed VB6 cycle #{{count}} in {{duration}}ms", 
                 _processedCount, cycleDuration.TotalMilliseconds);
@@ -503,6 +481,7 @@ public class Worker : BackgroundService
         {{
             _errorCount++;
             _logger.LogError(ex, "Error in processing cycle #{{count}}", _processedCount);
+            
             var errorDelay = Math.Min(5000 * _errorCount, 30000);
             await Task.Delay(errorDelay, stoppingToken);
         }}
@@ -517,6 +496,7 @@ public class Worker : BackgroundService
         try
         {{
             {self._generate_procedure_calls(procedures, context_map)}
+            
             await Task.Delay(50, stoppingToken);
         }}
         catch (Exception ex)
@@ -528,16 +508,20 @@ public class Worker : BackgroundService
     private async Task PerformCleanup()
     {{
         _logger.LogInformation("Performing VB6 service cleanup...");
+        
         try
         {{
             lock (_lockObject)
             {{
                 _isProcessing = false;
+                
                 if (_msgData != null) Array.Clear(_msgData, 0, _msgData.Length);
                 if (_maskData != null) Array.Clear(_maskData, 0, _maskData.Length);
             }}
+            
             _logger.LogInformation("VB6 Final statistics - Processed: {{processed}}, Errors: {{errors}}", 
                 _processedCount, _errorCount);
+            
             await Task.Delay(100);
         }}
         catch (Exception ex)
@@ -610,8 +594,10 @@ public class ReturnCode
     public string Message {{ get; set; }} = string.Empty;
     public bool IsSuccess {{ get; set; }}
     public DateTime Timestamp {{ get; set; }} = DateTime.Now;
+    
     public static ReturnCode Success {{ get; }} = new ReturnCode {{ Code = 0, Message = "Success", IsSuccess = true }};
     public static ReturnCode Failure {{ get; }} = new ReturnCode {{ Code = -1, Message = "Failure", IsSuccess = false }};
+    
     public static ReturnCode Error(int code, string message)
     {{
         return new ReturnCode {{ Code = code, Message = message, IsSuccess = false }};
@@ -628,6 +614,7 @@ public enum SeriesDirections
 """
 
     def _sanitize_namespace(self, name: str) -> str:
+        """Sanitize module name for use in C# namespace."""
         return re.sub(r'[^a-zA-Z0-9]', '', name) or "ConvertedService"
 
     def _generate_fields(self, globals_list: List) -> str:
@@ -926,12 +913,14 @@ var result = _processedCount + _random.Next(1, 100);""" + (f'\nreturn {self._get
         module_hierarchy = context_map.get('module_hierarchy', {})
         main_module = module_hierarchy.get('main_module', '')
         call_graph = module_hierarchy.get('call_graph', [])
+        # Group procedures by module
         module_procs = {}
         for proc in procedures:
             module_name = proc.get('module_name', '')
             if module_name not in module_procs:
                 module_procs[module_name] = []
             module_procs[module_name].append(proc)
+        # Prioritize main module and dependencies
         ordered_modules = [main_module] + [m for m in module_procs.keys() if m and m != main_module]
         for module_name in ordered_modules:
             if module_name in module_procs:
@@ -1097,6 +1086,7 @@ public class Worker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {{
         _logger.LogInformation("VB6 Converted Worker Service started at: {{time}}", DateTimeOffset.Now);
+        
         while (!stoppingToken.IsCancellationRequested)
         {{
             try
@@ -1115,17 +1105,20 @@ public class Worker : BackgroundService
                 await Task.Delay(5000, stoppingToken);
             }}
         }}
+        
         _logger.LogInformation("VB6 Converted Worker Service stopped at: {{time}}", DateTimeOffset.Now);
     }}
 
     private async Task ProcessVB6Logic(CancellationToken stoppingToken)
     {{
         _logger.LogInformation("Processing VB6 logic - ByteCount: {{bc}}, Command: {{cmd}}", _bc, _cmd);
+        
         lock (_lockObject)
         {{
             _cmd = (byte)((_cmd + 1) % 256);
             _req = (byte)((_req + 1) % 256);
         }}
+        
         await Task.Delay(100, stoppingToken);
     }}
 
@@ -1165,6 +1158,7 @@ public class Worker : BackgroundService
         bool summation = false)
     {{
         _logger.LogInformation("VB6 GetComputedResult called for parameter: {{param}}", parameterXYZName);
+        
         try
         {{
             valResult = new ValueResult 
@@ -1173,6 +1167,7 @@ public class Worker : BackgroundService
                 IsValid = true,
                 ParameterName = parameterXYZName
             }};
+            
             return ReturnCode.Success;
         }}
         catch (Exception ex)
@@ -1253,18 +1248,28 @@ using Microsoft.Extensions.Logging.Configuration;
 using Microsoft.Extensions.Logging.EventLog;
 
 var builder = Host.CreateApplicationBuilder(args);
+
+// Configure logging
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
+
+// Add Windows Event Log if running on Windows
 if (OperatingSystem.IsWindows())
 {
     builder.Logging.AddEventLog();
 }
+
+// Add the worker service
 builder.Services.AddHostedService<Worker>();
+
+// Configure Windows Service
 builder.Services.AddWindowsService(options =>
 {
     options.ServiceName = "VB6 Converted Service";
 });
+
 var host = builder.Build();
+
 try
 {
     await host.RunAsync();
@@ -1339,6 +1344,7 @@ class BaseAgent:
         self.state = AgentState.IDLE
 
     async def set_state(self, state: AgentState, message: str = ""):
+        """Set the agent's state and emit it to the SSE queue."""
         self.state = state
         logger.info(
             message or f"{self.name} state changed to {state.value}",
@@ -1361,7 +1367,7 @@ class IngestorAgent(BaseAgent):
             if zip_file:
                 if zip_file.size and zip_file.size > MAX_FILE_SIZE_MB * 1024 * 1024:
                     await self.set_state(AgentState.FAILED, f"File too large. Maximum size: {MAX_FILE_SIZE_MB}MB")
-                    raise HTTPException(status_code=400, detail=f"File too large. Maximum size: {MAX_FILE_SIZE_MB}MB")
+                    raise HTTPException(f"File too large. Maximum size: {MAX_FILE_SIZE_MB}MB")
                 zip_path = os.path.join(temp_dir, "upload.zip")
                 await self.set_state(AgentState.RUNNING, "Saving uploaded ZIP file")
                 with open(zip_path, "wb") as f:
@@ -1382,9 +1388,6 @@ class IngestorAgent(BaseAgent):
                 if not any(domain in github_link for domain in ALLOWED_GITHUB_DOMAINS):
                     await self.set_state(AgentState.FAILED, "GitHub domain not allowed")
                     raise HTTPException(status_code=400, detail="GitHub domain not allowed")
-                if not re.match(r'^https?://github\.com/[\w-]+/[\w-]+/?$', github_link.strip('/')):
-                    await self.set_state(AgentState.FAILED, "Invalid GitHub repository URL")
-                    raise HTTPException(status_code=400, detail="Invalid GitHub repository URL")
                 github_link = re.sub(r'[^a-zA-Z0-9:/.-]', '', github_link)
                 await self.set_state(AgentState.RUNNING, f"Cloning GitHub repository: {github_link}")
                 try:
@@ -1517,10 +1520,8 @@ class FileBuilderAgent(BaseAgent):
     def __init__(self):
         super().__init__("FileBuilderAgent")
 
-    async def run(self, code_files: dict) -> tuple[bytes, str]:
+    async def run(self, code_files: dict) -> bytes:
         await self.set_state(AgentState.RUNNING, "Starting file building")
-        conversion_id = str(uuid.uuid4())
-        output_file_path = OUTPUT_DIR / f"{conversion_id}.zip"
         try:
             with tempfile.TemporaryDirectory() as project_dir:
                 properties_dir = os.path.join(project_dir, "Properties")
@@ -1530,23 +1531,18 @@ class FileBuilderAgent(BaseAgent):
                     os.makedirs(os.path.dirname(filepath), exist_ok=True)
                     with open(filepath, 'w', encoding='utf-8') as f:
                         f.write(content)
-                with zipfile.ZipFile(output_file_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
                     for root, _, files in os.walk(project_dir):
                         for file in files:
                             file_path = os.path.join(root, file)
                             arc_path = os.path.relpath(file_path, project_dir)
                             zip_file.write(file_path, arc_path)
-            if not output_file_path.exists() or output_file_path.stat().st_size == 0:
-                await self.set_state(AgentState.FAILED, "Generated ZIP file is empty or missing")
-                raise HTTPException(status_code=500, detail="Generated ZIP file is empty or missing")
-            await self.set_state(AgentState.COMPLETED, f"Successfully built project ZIP with {len(code_files)} files")
-            with open(output_file_path, 'rb') as f:
-                result_data = f.read()
-            return result_data, conversion_id
+                buffer.seek(0)
+                await self.set_state(AgentState.COMPLETED, f"Successfully built project ZIP with {len(code_files)} files")
+                return buffer.read()
         except Exception as e:
             await self.set_state(AgentState.FAILED, f"File builder error: {str(e)}")
-            if output_file_path.exists():
-                output_file_path.unlink()
             raise HTTPException(status_code=500, detail=f"Project building failed: {str(e)}")
 
 class MCP:
@@ -1558,52 +1554,29 @@ class MCP:
         self.generator = GeneratorAgent()
         self.filebuilder = FileBuilderAgent()
         self.log_queue = sse_handler.queue
-        self.agents = [
-            self.ingestor,
-            self.parser,
-            self.context_analyzer,
-            self.summarizer,
-            self.generator,
-            self.filebuilder
-        ]
 
-    async def run(self, zip_file: Optional[UploadFile], github_link: Optional[str]) -> tuple[bytes, str]:
+    async def run(self, zip_file: Optional[UploadFile], github_link: Optional[str]) -> bytes:
         with tempfile.TemporaryDirectory() as temp_dir:
             await self.set_pipeline_state(AgentState.RUNNING, "Starting VB6 to .NET conversion pipeline")
             try:
-                for agent in self.agents:
-                    if agent != self.ingestor:
-                        await agent.set_state(AgentState.IDLE)
                 files = await self.ingestor.run(zip_file, github_link, temp_dir)
                 await self.set_pipeline_state(AgentState.RUNNING, f"Processing {len(files)} VB6 files")
-                await self.ingestor.set_state(AgentState.COMPLETED)
-                await self.parser.set_state(AgentState.RUNNING)
                 files_to_process = files[:MAX_FILES]
                 if len(files) > MAX_FILES:
                     logger.warning(f"Processing only first {MAX_FILES} files out of {len(files)} total", extra={"stage": "pipeline"})
                 parsed_results = await asyncio.gather(*[self.parser.run(f) for f in files_to_process])
-                await self.parser.set_state(AgentState.COMPLETED)
-                await self.context_analyzer.set_state(AgentState.RUNNING)
                 context_map = await self.context_analyzer.run(parsed_results)
-                await self.context_analyzer.set_state(AgentState.COMPLETED)
-                await self.summarizer.set_state(AgentState.RUNNING)
                 yaml_summary = await self.summarizer.run(parsed_results)
-                await self.summarizer.set_state(AgentState.COMPLETED)
-                await self.generator.set_state(AgentState.RUNNING)
                 code_files = await self.generator.run(yaml_summary, context_map)
-                await self.generator.set_state(AgentState.COMPLETED)
-                await self.filebuilder.set_state(AgentState.RUNNING)
-                result, conversion_id = await self.filebuilder.run(code_files)
-                await self.filebuilder.set_state(AgentState.COMPLETED)
+                result = await self.filebuilder.run(code_files)
                 await self.set_pipeline_state(AgentState.COMPLETED, "Conversion pipeline completed")
-                return result, conversion_id
+                return result
             except Exception as e:
                 await self.set_pipeline_state(AgentState.FAILED, f"Conversion pipeline failed: {str(e)}")
-                for agent in self.agents:
-                    await agent.set_state(AgentState.FAILED)
                 raise
 
     async def set_pipeline_state(self, state: AgentState, message: str):
+        """Emit pipeline-level state updates."""
         logger.info(
             message,
             extra={
@@ -1620,7 +1593,7 @@ mcp = MCP()
 async def root():
     return {
         "message": "VB6 to .NET Converter API",
-        "version": "2.0.6",
+        "version": "2.0.4",
         "status": "running",
         "timestamp": time.time()
     }
@@ -1638,95 +1611,89 @@ async def convert_vb6_to_dotnet(
     zip_file: Optional[UploadFile] = File(None),
     github_link: Optional[str] = Form(None)
 ):
+    """Convert VB6 project to .NET 9 Worker Service"""
     if not zip_file and not github_link:
         raise HTTPException(status_code=400, detail="Please provide either a ZIP file or GitHub repository link")
     start_time = time.time()
     try:
         logger.info("Starting VB6 to .NET conversion", extra={"stage": "pipeline", "progress": 0})
-        conversion_task = asyncio.create_task(mcp.run(zip_file, github_link))
-        result_data, conversion_id = await asyncio.wait_for(conversion_task, timeout=CONVERSION_TIMEOUT_SECONDS)
+        result_data = await mcp.run(zip_file, github_link)
         duration = time.time() - start_time
-        output_file_path = OUTPUT_DIR / f"{conversion_id}.zip"
-        with open(output_file_path, 'wb') as f:
-            f.write(result_data)
         logger.info(f"Conversion completed successfully in {duration:.2f} seconds", extra={"stage": "pipeline", "progress": 100})
-        return {
-            "status": "success",
-            "conversion_id": conversion_id,
-            "duration": duration,
-            "message": "Conversion completed. Use the conversion_id to download the file.",
-            "download_url": f"/download/{conversion_id}"
-        }
-    except asyncio.TimeoutError:
-        duration = time.time() - start_time
-        logger.error(f"Conversion timed out after {duration:.2f} seconds", extra={"stage": "pipeline"})
-        raise HTTPException(status_code=504, detail="Conversion process timed out")
+        return StreamingResponse(
+            io.BytesIO(result_data),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": "attachment; filename=MyWindowsService.zip",
+                "X-Conversion-Time": str(duration)
+            }
+        )
     except HTTPException:
         raise
     except Exception as e:
         duration = time.time() - start_time
         logger.error(f"Conversion failed after {duration:.2f} seconds: {str(e)}", extra={"stage": "pipeline"})
         raise HTTPException(
-            status_code=500,
+            status_code=500, 
             detail=f"Internal server error during conversion: {str(e)}"
         )
 
-@app.get("/download/{conversion_id}")
-async def download_converted_file(conversion_id: str):
-    file_path = OUTPUT_DIR / f"{conversion_id}.zip"
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found or expired")
-    if file_path.stat().st_size == 0:
-        file_path.unlink()
-        raise HTTPException(status_code=500, detail="File is empty")
-    try:
-        return FileResponse(
-            file_path,
-            filename="MyWindowsService.zip",
-            headers={"Content-Disposition": "attachment; filename=MyWindowsService.zip"}
-        )
-    except Exception as e:
-        mcp.logger.error(f"Error serving file {conversion_id}: {str(e)}", extra={"stage": "download"})
-        raise HTTPException(status_code=500, detail=f"Error serving file: {str(e)}")
-    finally:
-        try:
-            file_path.unlink(missing_ok=True)
-            mcp.logger.info(f"Deleted downloaded file: {file_path}", extra={"stage": "download"})
-        except Exception as e:
-            mcp.logger.error(f"Failed to delete file {file_path}: {str(e)}", extra={"stage": "download"})
-
-@app.get("/stream")
-async def stream_conversion_progress():
+@app.get("/convert/stream")
+async def convert_stream():
+    """Stream conversion process updates via SSE"""
     async def event_generator():
-        while True:
-            try:
-                event = await asyncio.wait_for(mcp.log_queue.get(), timeout=30.0)
-                yield {
-                    "event": event.get("event_type", "log"),
-                    "data": json.dumps({
-                        "message": event.get("message", ""),
-                        "level": event.get("level", "INFO"),
-                        "timestamp": event.get("timestamp", time.time()),
-                        "stage": event.get("stage", "unknown"),
-                        "agent": event.get("agent", None),
-                        "state": event.get("state", None),
-                        "current_agent": event.get("current_agent", None),
-                        "progress": event.get("progress", 0),
-                        "details": event.get("details", {})
-                    })
-                }
-                if event.get("stage") == "pipeline" and event.get("state") in ["Completed", "Failed"]:
-                    break
-            except asyncio.TimeoutError:
-                yield {
-                    "event": "ping",
-                    "data": json.dumps({
-                        "message": "Keep-alive ping",
-                        "timestamp": time.time(),
-                        "progress": mcp.sse_handler.progress
-                    })
-                }
-    return EventSourceResponse(event_generator())
+        try:
+            while True:
+                try:
+                    log_entry = await asyncio.wait_for(mcp.log_queue.get(), timeout=30.0)
+                    yield {
+                        "event": log_entry["event_type"],
+                        "data": json.dumps({
+                            "message": log_entry["message"],
+                            "timestamp": log_entry["timestamp"],
+                            "stage": log_entry["stage"],
+                            "agent": log_entry["agent"],
+                            "state": log_entry["state"],
+                            "progress": log_entry["progress"],
+                            "details": log_entry["details"],
+                            "level": log_entry["level"]
+                        })
+                    }
+                except asyncio.TimeoutError:
+                    yield {
+                        "event": "keepalive",
+                        "data": json.dumps({
+                            "message": "No new updates",
+                            "timestamp": time.time(),
+                            "progress": sse_handler.progress,
+                            "details": {"stage_progress": 0}
+                        })
+                    }
+                except Exception as e:
+                    logger.error(f"Unexpected error in event generator: {str(e)}", extra={"stage": "streaming"})
+                    yield {
+                        "event": "error",
+                        "data": json.dumps({
+                            "message": f"Streaming error: {str(e)}",
+                            "timestamp": time.time(),
+                            "progress": sse_handler.progress,
+                            "details": {"stage_progress": 0}
+                        })
+                    }
+        except GeneratorExit:
+            logger.info("SSE connection closed by client", extra={"stage": "streaming"})
+            yield {
+                "event": "connection_closed",
+                "data": json.dumps({
+                    "message": "Client disconnected",
+                    "timestamp": time.time(),
+                    "progress": sse_handler.progress,
+                    "details": {"stage_progress": 0}
+                })
+            }
+
+    return EventSourceResponse(event_generator(), headers={"Cache-Control": "no-cache"})
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
