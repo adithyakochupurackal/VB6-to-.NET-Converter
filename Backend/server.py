@@ -19,6 +19,13 @@ import time
 import re
 from sse_starlette.sse import EventSourceResponse
 from enum import Enum
+from typing import Dict, Optional
+from datetime import datetime
+import uuid
+import threading
+from fastapi.responses import StreamingResponse
+
+
 
 # Define AgentState Enum
 class AgentState(Enum):
@@ -37,36 +44,41 @@ class SSELogHandler(logging.Handler):
         super().__init__()
         self.queue = asyncio.Queue()
         self.progress = 0
-        self.total_stages = 6  # Ingestor, Parser, ContextAnalyzer, Summarizer, Generator, FileBuilder
+        self.total_stages = 6
+        self.completed_stages = set()  # Track completed stages
 
     def emit(self, record):
         try:
             msg = self.format(record)
             event_type = getattr(record, 'event_type', 'log')
             stage = getattr(record, 'stage', 'general')
-            
-            # Update progress based on stage completion
-            if event_type == "state_update" and getattr(record, 'state', None) == AgentState.COMPLETED.value:
+            state = getattr(record, 'state', None)
+            agent = getattr(record, 'agent', None)
+
+            # Update progress only for new stage completions
+            if event_type == "state_update" and state == AgentState.COMPLETED.value and stage not in self.completed_stages:
                 self.progress = min(self.progress + (100 // self.total_stages), 100)
-            
-            self.queue.put_nowait({
+                self.completed_stages.add(stage)
+
+            log_entry = {
                 "event_type": event_type,
                 "level": record.levelname,
                 "message": msg,
                 "timestamp": time.time(),
                 "stage": stage,
-                "agent": getattr(record, 'agent', None),
-                "state": getattr(record, 'state', None),
+                "agent": agent,
+                "state": state,
                 "progress": self.progress,
                 "details": {
-                    "stage_progress": self._get_stage_progress(stage, getattr(record, 'state', None))
+                    "stage_progress": self._get_stage_progress(stage, state)
                 }
-            })
+            }
+            print("Emitting SSE:", log_entry)  # Debug log
+            self.queue.put_nowait(log_entry)
         except Exception:
             self.handleError(record)
 
     def _get_stage_progress(self, stage: str, state: Optional[str]) -> float:
-        """Calculate progress within a specific stage."""
         stage_weights = {
             "ingestor": 10,
             "parser": 30,
@@ -75,7 +87,7 @@ class SSELogHandler(logging.Handler):
             "generator": 20,
             "filebuilder": 10
         }
-        return stage_weights.get(stage.lower(), 10) if state == AgentState.COMPLETED.value else 0
+        return stage_weights.get(stage.lower(), 10) if state == AgentState.COMPLETED.value else 50 if state == AgentState.RUNNING.value else 0
 
 # Load environment variables
 load_dotenv()
@@ -108,6 +120,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+conversion_status = {}
 
 # Azure OpenAI client setup
 openai_client = AzureOpenAI(
@@ -272,6 +286,61 @@ VB6 Code to analyze:
         except Exception as e:
             logger.error(f"ParserModule forward error: {e}", extra={"stage": "parser"})
             return {"procedures": [], "events": [], "globals": [], "dependencies": [], "main_logic": {}, "metadata": {"file_name": file_name, "module_type": "Unknown", "total_lines": len(code.splitlines())}}
+
+
+class ConversionStatus:
+    def __init__(self, conversion_id: str):
+        self.conversion_id = conversion_id
+        self.steps = {
+            "ingestor": {"status": "pending", "progress": 0},
+            "parser": {"status": "pending", "progress": 0},
+            "context_analyzer": {"status": "pending", "progress": 0},
+            "summarizer": {"status": "pending", "progress": 0},
+            "generator": {"status": "pending", "progress": 0},
+            "filebuilder": {"status": "pending", "progress": 0},
+        }
+        self.overall_progress = 0
+        self.error = None
+        self.completed = False
+        self.current_step = "pending"
+
+    def start_step(self, step_name: str):
+        self.current_step = step_name
+        self.steps[step_name]["status"] = "running"
+        self.steps[step_name]["progress"] = 50
+
+    def complete_step(self, step_name: str):
+        self.steps[step_name]["status"] = "completed"
+        self.steps[step_name]["progress"] = 100
+        completed_steps = sum(1 for step in self.steps.values() if step["status"] == "completed")
+        self.overall_progress = (completed_steps / len(self.steps)) * 100
+
+    def to_dict(self):
+        return {
+            "conversion_id": self.conversion_id,
+            "current_step": self.current_step,
+            "steps": self.steps,
+            "overall_progress": self.overall_progress,
+            "error": self.error,
+            "completed": self.completed
+        }
+
+# Add this new endpoint ONLY (don't modify existing ones)
+@app.get("/conversion/status/{conversion_id}")
+async def get_conversion_status(conversion_id: str):
+    status = conversion_status.get(conversion_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Conversion not found")
+    return status.to_dict()
+
+# Add this helper function to update status from your existing agents
+def update_conversion_status(conversion_id: str, step_name: str, status: str):
+    """Call this from your existing agent code"""
+    if conversion_id in conversion_status:
+        if status == "running":
+            conversion_status[conversion_id].start_step(step_name)
+        elif status == "completed":
+            conversion_status[conversion_id].complete_step(step_name)
 
 class ContextAnalyzerModule(dspy.Module):
     def __init__(self):
@@ -1361,7 +1430,7 @@ class IngestorAgent(BaseAgent):
     def __init__(self):
         super().__init__("IngestorAgent")
 
-    async def run(self, zip_file: Optional[UploadFile], github_link: Optional[str], temp_dir: str) -> List[dict]:
+    async def run(self, zip_file: Optional[UploadFile], github_link: Optional[str], temp_dir: str, conversion_id: str = None) -> List[dict]:
         await self.set_state(AgentState.RUNNING, "Starting ingestion process")
         try:
             if zip_file:
@@ -1415,10 +1484,14 @@ class ParserAgent(BaseAgent):
     def __init__(self):
         super().__init__("ParserAgent")
         self.parser = ParserModule()
+        self._parsing_started = False
 
-    async def run(self, file_info: dict) -> dict:
+    async def run(self, file_info: dict, conversion_id: str = None) -> dict:
         file_path = file_info['path']
         file_name = file_info['name']
+        if not self._parsing_started:
+            await self.set_state(AgentState.RUNNING, "Starting VB6 code parsing")
+            self._parsing_started = True
         await self.set_state(AgentState.RUNNING, f"Parsing file: {file_name}")
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -1448,7 +1521,7 @@ class ContextAnalyzerAgent(BaseAgent):
         super().__init__("ContextAnalyzerAgent")
         self.analyzer = ContextAnalyzerModule()
 
-    async def run(self, parsed_results: List[dict]) -> dict:
+    async def run(self, parsed_results: List[dict], conversion_id: str = None) -> dict:
         await self.set_state(AgentState.RUNNING, "Running context analysis")
         try:
             result = await asyncio.to_thread(self.analyzer.forward, parsed_results)
@@ -1462,7 +1535,7 @@ class SummarizerAgent(BaseAgent):
     def __init__(self):
         super().__init__("SummarizerAgent")
 
-    async def run(self, parsed_results: List[dict]) -> str:
+    async def run(self, parsed_results: List[dict], conversion_id: str = None) -> str:
         await self.set_state(AgentState.RUNNING, "Starting summarization")
         try:
             valid_results = [r for r in parsed_results if isinstance(r, dict)]
@@ -1506,7 +1579,7 @@ class GeneratorAgent(BaseAgent):
         super().__init__("GeneratorAgent")
         self.generator = GeneratorModule()
 
-    async def run(self, yaml_summary: str, context_map: dict) -> dict:
+    async def run(self, yaml_summary: str, context_map: dict, conversion_id: str = None) -> dict:
         await self.set_state(AgentState.RUNNING, "Running code generation")
         try:
             result = await asyncio.to_thread(self.generator.forward, yaml_summary, context_map)
@@ -1520,7 +1593,7 @@ class FileBuilderAgent(BaseAgent):
     def __init__(self):
         super().__init__("FileBuilderAgent")
 
-    async def run(self, code_files: dict) -> bytes:
+    async def run(self, code_files: dict, conversion_id: str = None) -> bytes:
         await self.set_state(AgentState.RUNNING, "Starting file building")
         try:
             with tempfile.TemporaryDirectory() as project_dir:
@@ -1555,20 +1628,33 @@ class MCP:
         self.filebuilder = FileBuilderAgent()
         self.log_queue = sse_handler.queue
 
-    async def run(self, zip_file: Optional[UploadFile], github_link: Optional[str]) -> bytes:
+    async def run(self, zip_file: Optional[UploadFile], github_link: Optional[str],conversion_id: str = None) -> bytes:
         with tempfile.TemporaryDirectory() as temp_dir:
             await self.set_pipeline_state(AgentState.RUNNING, "Starting VB6 to .NET conversion pipeline")
             try:
-                files = await self.ingestor.run(zip_file, github_link, temp_dir)
+                if conversion_id and conversion_id in conversion_status:
+                    conversion_status[conversion_id].start_step("ingestor")
+                files = await self.ingestor.run(zip_file, github_link, temp_dir, conversion_id)
                 await self.set_pipeline_state(AgentState.RUNNING, f"Processing {len(files)} VB6 files")
+                if conversion_id and conversion_id in conversion_status:
+                    conversion_status[conversion_id].complete_step("ingestor")
+                    conversion_status[conversion_id].start_step("parser")
                 files_to_process = files[:MAX_FILES]
                 if len(files) > MAX_FILES:
                     logger.warning(f"Processing only first {MAX_FILES} files out of {len(files)} total", extra={"stage": "pipeline"})
-                parsed_results = await asyncio.gather(*[self.parser.run(f) for f in files_to_process])
-                context_map = await self.context_analyzer.run(parsed_results)
-                yaml_summary = await self.summarizer.run(parsed_results)
-                code_files = await self.generator.run(yaml_summary, context_map)
-                result = await self.filebuilder.run(code_files)
+                parsed_results = await asyncio.gather(*[self.parser.run(f,conversion_id) for f in files_to_process])
+                if conversion_id and conversion_id in conversion_status:
+                    conversion_status[conversion_id].complete_step("parser")
+                    conversion_status[conversion_id].start_step("context_analyzer")
+                context_map = await self.context_analyzer.run(parsed_results,conversion_id)
+                yaml_summary = await self.summarizer.run(parsed_results,conversion_id)
+                code_files = await self.generator.run(yaml_summary, context_map, conversion_id)
+                if conversion_id and conversion_id in conversion_status:
+                    conversion_status[conversion_id].complete_step("generator")
+                    conversion_status[conversion_id].start_step("filebuilder")
+                result = await self.filebuilder.run(code_files, conversion_id)
+                if conversion_id and conversion_id in conversion_status:
+                    conversion_status[conversion_id].complete_step("filebuilder")
                 await self.set_pipeline_state(AgentState.COMPLETED, "Conversion pipeline completed")
                 return result
             except Exception as e:
@@ -1607,36 +1693,37 @@ async def health():
     }
 
 @app.post("/convert")
-async def convert_vb6_to_dotnet(
+async def convert_vb6_project(
     zip_file: Optional[UploadFile] = File(None),
-    github_link: Optional[str] = Form(None)
+    github_link: Optional[str] = Form(None),
+    conversion_id: Optional[str] = Form(None)  # Add this parameter
 ):
-    """Convert VB6 project to .NET 9 Worker Service"""
-    if not zip_file and not github_link:
-        raise HTTPException(status_code=400, detail="Please provide either a ZIP file or GitHub repository link")
-    start_time = time.time()
+    # Generate conversion_id if not provided
+    if not conversion_id:
+        conversion_id = str(uuid.uuid4())
+    
+    # Initialize status tracking
+    conversion_status[conversion_id] = ConversionStatus(conversion_id)
+    
     try:
-        logger.info("Starting VB6 to .NET conversion", extra={"stage": "pipeline", "progress": 0})
-        result_data = await mcp.run(zip_file, github_link)
-        duration = time.time() - start_time
-        logger.info(f"Conversion completed successfully in {duration:.2f} seconds", extra={"stage": "pipeline", "progress": 100})
+        # Run your existing MCP pipeline
+        result_bytes = await mcp.run(zip_file, github_link, conversion_id)  # Pass conversion_id
+        
+        # Mark as completed
+        conversion_status[conversion_id].completed = True
+        conversion_status[conversion_id].overall_progress = 100
+        
+        # Return the ZIP file as before (keeping your download working)
         return StreamingResponse(
-            io.BytesIO(result_data),
+            io.BytesIO(result_bytes),
             media_type="application/zip",
-            headers={
-                "Content-Disposition": "attachment; filename=MyWindowsService.zip",
-                "X-Conversion-Time": str(duration)
-            }
+            headers={"Content-Disposition": "attachment; filename=MyWindowsService.zip"}
         )
-    except HTTPException:
-        raise
+        
     except Exception as e:
-        duration = time.time() - start_time
-        logger.error(f"Conversion failed after {duration:.2f} seconds: {str(e)}", extra={"stage": "pipeline"})
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Internal server error during conversion: {str(e)}"
-        )
+        if conversion_id in conversion_status:
+            conversion_status[conversion_id].error = str(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/convert/stream")
 async def convert_stream():
